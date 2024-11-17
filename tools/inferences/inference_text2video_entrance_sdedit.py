@@ -33,9 +33,13 @@ from utils.registry_class import INFER_ENGINE, MODEL, EMBEDDER, AUTO_ENCODER, DI
 from utils.camera_utils import get_camera
 
 from core.utils import get_rays
+import sys
+guidance_path = "/data2/suho/suho_hair_transfer/guidance"
+sys.path.append(guidance_path)
+from sdedit_guidance_30 import SDEdit_dataset
 
 @INFER_ENGINE.register_function()
-def inference_text2video_entrance(cfg_update,  **kwargs):
+def inference_text2video_entrance_sdedit(cfg_update,  **kwargs):
     for k, v in cfg_update.items():
         if isinstance(v, dict) and k in cfg:
             cfg[k].update(v)
@@ -104,7 +108,7 @@ def worker(gpu, cfg, cfg_update):
     logging.info(f"Going into inference_text2video_entrance inference on {gpu} gpu")
     
     # [Diffusion]
-    diffusion = DIFFUSION.build(cfg.Diffusion)
+    diffusion = DIFFUSION.build(cfg.Diffusion) # 내가 만든 diffusion 모듈을 가져온다고 가정
 
     # [Data] Data Transform    
     train_trans = data.Compose([
@@ -149,11 +153,52 @@ def worker(gpu, cfg, cfg_update):
     torch.cuda.empty_cache()
     
     # [Test List]
-    test_list = open(cfg.test_list_path).readlines()
-    test_list = [item.strip() for item in test_list]
-    num_videos = len(test_list)
-    logging.info(f'There are {num_videos} videos. with {cfg.round} times')
-    test_list = [item for item in test_list for _ in range(cfg.round)]
+    # test_list = open(cfg.test_list_path).readlines()
+    # test_list = [item.strip() for item in test_list]
+    # num_videos = len(test_list)
+    # logging.info(f'There are {num_videos} videos. with {cfg.round} times')
+    # test_list = [item for item in test_list for _ in range(cfg.round)]
+    
+    # dataset load 일단 하드코딩 
+    data_root = '/data2/suho/lab_gs_2'
+    hair_case = 4
+    face_case = 1
+
+    transfer_path = f'{data_root}/transfer_results/{hair_case}_{face_case}'
+    cam_distance = 30.0
+
+    image_path = f"{transfer_path}/diffusion_input_image_{cam_distance}"
+    face_path = f"{transfer_path}/sdedit_face_disocclusion_{cam_distance}"
+    body_path = f"{transfer_path}/repaint_body_disocclusion_{cam_distance}"
+    hair_body_path = f"{transfer_path}/sdedit_hair_body_overlap_{cam_distance}"
+
+    camera_pose = f"dist_{cam_distance}_15_test_camera_poses_dict.pkl"
+    camera_pose_parameter_path = f"{data_root}/{face_case}/{camera_pose}"
+
+    long_hair = True
+    hair_long_hair = False
+    girl = True 
+
+    dataset = SDEdit_dataset(
+                                camera_parameters_path=camera_pose_parameter_path,
+                                image_path=image_path,
+                                face_disocclusion_mask_path=face_path,
+                                body_disocclusion_mask_path=body_path,
+                                hair_body_overlap_mask_path=hair_body_path,
+                                face_case=face_case,
+                                long_hair=long_hair,
+                                hair_long_hair=hair_long_hair,
+                                girl=girl
+                            )
+    
+    image_group = dataset.group_by_theta_and_phi()
+    
+    # image_group[90.0]['images'] : 0~360도까지 15도 간격으로 촬영한 이미지들 [3, 24, 256, 256]
+    # image_group[90.0]['face_masks'] : 0~360도까지 15도 간격으로 촬영한 face mask 이미지들 [1, 24, 256, 256]
+    # image_group[90.0]['body_masks'] : 0~360도까지 15도 간격으로 촬영한 body mask 이미지들 [1, 24, 256, 256]
+    # image_group[90.0]['hair_body_masks'] : 0~360도까지 15도 간격으로 촬영한 hair body mask 이미지들 [1, 24, 256, 256]
+    
+    body_prompt = dataset[0]['body_prompt']
 
     # intrinsics
     from core.options import config_defaults
@@ -167,11 +212,14 @@ def worker(gpu, cfg, cfg_update):
     proj_matrix[3, 2] = - (opt.zfar * opt.znear) / (opt.zfar - opt.znear)
     proj_matrix[2, 3] = 1
 
-    for idx, caption in enumerate(test_list):
+    for idx in range(1):
+        
+        caption = body_prompt
+        
         if caption.startswith('#'):
             logging.info(f'Skip {caption}')
             continue
-        logging.info(f"[{idx}]/[{num_videos}] Begin to sample {caption} ...")
+        # logging.info(f"[{idx}]/[{num_videos}] Begin to sample {caption} ...")
         if caption == "": 
             logging.info(f'Caption is null of {caption}, skip..')
             continue
@@ -181,7 +229,7 @@ def worker(gpu, cfg, cfg_update):
 
 
         # if cfg.UNet.use_camera_condition:
-        elevation = 15
+        elevation = 0 # 0, 15, 30, 45, 60, 75, 90
         camera_dist = 2.0
         camera_data = get_camera(cfg.max_frames, elevation=elevation, azimuth_start=0, azimuth_span=360, camera_distance=camera_dist).unsqueeze(0)
         camera_data = camera_data.reshape(1,24,4,4)
@@ -250,33 +298,52 @@ def worker(gpu, cfg, cfg_update):
 
                 cur_seed = torch.initial_seed()
                 logging.info(f"Current seed {cur_seed} ...")
-                noise = torch.randn([1, 4, cfg.max_frames, int(cfg.resolution[1]/cfg.scale), int(cfg.resolution[0]/cfg.scale)])
+                # noise = torch.randn([1, 4, cfg.max_frames, int(cfg.resolution[1]/cfg.scale), int(cfg.resolution[0]/cfg.scale)])
                 # [1, 4, 24, 32, 32]
-                noise = noise.to(gpu)
+                # noise = noise.to(gpu)
 
                 model_kwargs=[
                     {'y': y_words, 'fps': fps_tensor, 'camera_data':camera_data},
                     {'y': zero_y_negative, 'fps': fps_tensor, 'camera_data':camera_data}]
-                video_data = diffusion.ddim_sample_loop(
-                    noise=noise,
-                    model=model.eval(),
-                    model_kwargs=model_kwargs,
-                    guide_scale=cfg.guide_scale,
-                    ddim_timesteps=50, 
-                    eta=0.0)
-
-                model_kwargs_gs=[
-                    {'y': y_words, 'fps': fps_tensor, 'camera_data':camera_data, 'gs_data': gs_data},
-                    {'y': zero_y_negative, 'fps': fps_tensor, 'camera_data':camera_data, 'gs_data': gs_data}]
                 
-                video_data_gs = diffusion.ddim_sample_loop(
-                    noise=noise,
-                    model=model.eval(),
-                    autoencoder=autoencoder,
-                    model_kwargs=model_kwargs_gs,
-                    guide_scale=cfg.guide_scale,
-                    ddim_timesteps=50, 
-                    eta=0.0)
+                
+                images = image_group[90.0]['images'].unsqueeze(0).to(gpu)
+                masks = image_group[90.0]['body_masks'].unsqueeze(0).to(gpu)
+                video_data = \
+                    diffusion.sdedit_sample_loop(
+                        model=model.eval(),
+                        original_image=images,
+                        mask=masks,
+                        num_inference_steps=20,
+                        autoencoder=autoencoder,
+                        use_autoencoder=False,
+                        model_kwargs=model_kwargs,
+                        guide_scale=cfg.guide_scale,
+                        ddim_timesteps=20,
+                        middle_time_steps=1000,
+                        jump_length=1,
+                        jump_n_sample=20,
+                    )
+                # video_data = diffusion.ddim_sample_loop(
+                #     noise=noise,
+                #     model=model.eval(),
+                #     model_kwargs=model_kwargs,
+                #     guide_scale=cfg.guide_scale,
+                #     ddim_timesteps=50, 
+                #     eta=0.0)
+
+                # model_kwargs_gs=[
+                #     {'y': y_words, 'fps': fps_tensor, 'camera_data':camera_data, 'gs_data': gs_data},
+                #     {'y': zero_y_negative, 'fps': fps_tensor, 'camera_data':camera_data, 'gs_data': gs_data}]
+                
+                # video_data_gs = diffusion.ddim_sample_loop(
+                #     noise=noise,
+                #     model=model.eval(),
+                #     autoencoder=autoencoder,
+                #     model_kwargs=model_kwargs_gs,
+                #     guide_scale=cfg.guide_scale,
+                #     ddim_timesteps=50, 
+                #     eta=0.0)
 
         video_data = 1. / cfg.scale_factor * video_data # [1, 4, 32, 46]
         video_data = rearrange(video_data, 'b c f h w -> (b f) c h w')
@@ -290,6 +357,9 @@ def worker(gpu, cfg, cfg_update):
         video_data = rearrange(video_data, '(b f) c h w -> b c f h w', b = cfg.batch_size)
         
         text_size = cfg.resolution[-1]
+        if len(caption.split(' ')) > 6:
+            caption = caption.split(' ')[:6]
+            caption = ' '.join(caption)
         cap_name = re.sub(r'[^\w\s]', '', caption).replace(' ', '_')
         file_name = f'rank_{cfg.world_size:02d}_{cfg.rank:02d}_{idx:04d}_{cap_name}_{int(elevation):02d}_{camera_dist:.02f}.mp4'
         local_path = os.path.join(cfg.log_dir, f'{file_name}')
@@ -300,27 +370,27 @@ def worker(gpu, cfg, cfg_update):
         except Exception as e:
             logging.info(f'Step: save text or video error with {e}')
 
-        video_data = 1. / cfg.scale_factor * video_data_gs # [1, 4, 32, 46]
-        video_data = rearrange(video_data, 'b c f h w -> (b f) c h w')
-        chunk_size = min(cfg.decoder_bs, video_data.shape[0])
-        video_data_list = torch.chunk(video_data, video_data.shape[0]//chunk_size, dim=0)
-        decode_data = []
-        for vd_data in video_data_list:
-            gen_frames = autoencoder.decode(vd_data)
-            decode_data.append(gen_frames)
-        video_data = torch.cat(decode_data, dim=0)
-        video_data = rearrange(video_data, '(b f) c h w -> b c f h w', b = cfg.batch_size)
+        # video_data = 1. / cfg.scale_factor * video_data_gs # [1, 4, 32, 46]
+        # video_data = rearrange(video_data, 'b c f h w -> (b f) c h w')
+        # chunk_size = min(cfg.decoder_bs, video_data.shape[0])
+        # video_data_list = torch.chunk(video_data, video_data.shape[0]//chunk_size, dim=0)
+        # decode_data = []
+        # for vd_data in video_data_list:
+        #     gen_frames = autoencoder.decode(vd_data)
+        #     decode_data.append(gen_frames)
+        # video_data = torch.cat(decode_data, dim=0)
+        # video_data = rearrange(video_data, '(b f) c h w -> b c f h w', b = cfg.batch_size)
         
-        text_size = cfg.resolution[-1]
-        cap_name = re.sub(r'[^\w\s]', '', caption).replace(' ', '_')
-        file_name = f'rank_{cfg.world_size:02d}_{cfg.rank:02d}_{idx:04d}_{cap_name}_{int(elevation):02d}_{camera_dist:.02f}_gs.mp4'
-        local_path = os.path.join(cfg.log_dir, f'{file_name}')
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        try:
-            save_i2vgen_video_safe(local_path, video_data.cpu(), captions, cfg.mean, cfg.std, text_size)
-            logging.info('Save video to dir %s:' % (local_path))
-        except Exception as e:
-            logging.info(f'Step: save text or video error with {e}')
+        # text_size = cfg.resolution[-1]
+        # cap_name = re.sub(r'[^\w\s]', '', caption).replace(' ', '_')
+        # file_name = f'rank_{cfg.world_size:02d}_{cfg.rank:02d}_{idx:04d}_{cap_name}_{int(elevation):02d}_{camera_dist:.02f}_gs.mp4'
+        # local_path = os.path.join(cfg.log_dir, f'{file_name}')
+        # os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        # try:
+        #     save_i2vgen_video_safe(local_path, video_data.cpu(), captions, cfg.mean, cfg.std, text_size)
+        #     logging.info('Save video to dir %s:' % (local_path))
+        # except Exception as e:
+        #     logging.info(f'Step: save text or video error with {e}')
     
     logging.info('Congratulations! The inference is completed!')
     # synchronize to finish some processes

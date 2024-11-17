@@ -14,8 +14,8 @@ use_zero_infer: True
 
 # For important input
 vldm_cfg: configs/i2vgen_xl_train.yaml
-test_list_path: data/test_images.txt
-test_model: ./pretrained_models/i2v_00882000.pth
+test_list_path: data/test_images_2.txt
+test_model: ./pretrained_models/i2v_882000.pth
 log_dir: "workspace/visualization/i2v"
 
 UNet: {

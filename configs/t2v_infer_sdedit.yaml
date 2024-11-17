@@ -1,6 +1,6 @@
-TASK_TYPE: inference_text2video_entrance
+TASK_TYPE: inference_text2video_entrance_sdedit
 use_fp16: False
-guide_scale: 9.0
+guide_scale: 3.0
 chunk_size: 4
 decoder_bs: 4
 max_frames: 24
@@ -12,8 +12,8 @@ use_zero_infer: True
 round: 2
 seed: 11
 
-test_list_path: ./data/test_prompts_3.txt
-vldm_cfg: configs/t2v_train.yaml
+test_list_path: ./data/20_1_20_g_3_0_add_small.txt
+vldm_cfg: configs/t2v_train_sdedit.yaml
 test_model: ./pretrained_models/t2v_333000.pth # non_ema_00365000.pth
 log_dir: ./workspace/visualization/t2v
 

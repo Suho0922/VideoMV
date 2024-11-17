@@ -1,0 +1,5 @@
+workspace/
+pretrained_models/
+*.png
+*.pyc
+*.zip

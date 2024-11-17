@@ -426,7 +426,7 @@ class UNetSD_T2VBase(nn.Module):
                 infer_images = rearrange(infer_images, 'b f c h w -> (b f) c h w')
                 infer_images = F.interpolate(infer_images, (256, 256), mode='nearest')
                 infer_images = infer_images.sub_(0.5).div_(0.5)
-
+                import ipdb; ipdb.set_trace()
                 latent_z = autoencoder.encode_firsr_stage(infer_images, 0.18215)
                 latent_z = rearrange(latent_z, '(b f) c h w -> b c f h w', b=batch)
 

@@ -5,7 +5,7 @@ import numpy as np
 from utils.registry_class import DIFFUSION
 from .schedules import beta_schedule
 from .losses import kl_divergence, discretized_gaussian_log_likelihood
-
+from scipy.ndimage import distance_transform_edt
 def _i(tensor, t, x):
     r"""Index tensor using t and format the output according to x.
     """
@@ -16,7 +16,7 @@ def _i(tensor, t, x):
 
 
 @DIFFUSION.register_class()
-class DiffusionDDIM(object):
+class SDEditDDIM(object):
     def __init__(self,
                  schedule='linear_sd',
                  schedule_param={},
@@ -26,6 +26,7 @@ class DiffusionDDIM(object):
                  epsilon = 1e-12,
                  rescale_timesteps=False,
                  noise_strength=0.0, 
+                 device='cuda',
                  **kwargs):
         # check input
         # check input
@@ -66,6 +67,10 @@ class DiffusionDDIM(object):
         self.posterior_log_variance_clipped = torch.log(self.posterior_variance.clamp(1e-20))
         self.posterior_mean_coef1 = betas * torch.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
         self.posterior_mean_coef2 = (1.0 - self.alphas_cumprod_prev) * torch.sqrt(alphas) / (1.0 - self.alphas_cumprod)
+
+        self.timesteps = None
+        self.device = device
+        self.middle_time_steps = None
     
 
     def sample_loss(self, x0, noise=None):
@@ -145,6 +150,8 @@ class DiffusionDDIM(object):
             # classifier-free guidance
             # (model_kwargs[0]: conditional kwargs; model_kwargs[1]: non-conditional kwargs)
             assert isinstance(model_kwargs, list) and len(model_kwargs) == 2
+
+            # import ipdb; ipdb.set_trace()
             
             y_out = model(xt, self._scale_timesteps(t), autoencoder=autoencoder, sqrt_alphas_cumprod=self.sqrt_alphas_cumprod, 
             sqrt_one_minus_alphas_cumprod=self.sqrt_one_minus_alphas_cumprod, sqrt_recip_alphas_cumprod=self.sqrt_recip_alphas_cumprod, \
@@ -230,7 +237,6 @@ class DiffusionDDIM(object):
                  _i(self.sqrt_recipm1_alphas_cumprod, t, xt) * eps
         
         # derive variables
-        # import ipdb; ipdb.set_trace()
         eps = (_i(self.sqrt_recip_alphas_cumprod, t, xt) * xt - x0) / \
               _i(self.sqrt_recipm1_alphas_cumprod, t, xt)
         alphas = _i(self.alphas_cumprod, t, xt)
@@ -259,6 +265,218 @@ class DiffusionDDIM(object):
             else:
                 xt, _ = self.ddim_sample(xt, t, model, None, model_kwargs, clamp, percentile, condition_fn, guide_scale, ddim_timesteps, eta)
         return xt
+    
+    
+    ################################ added ####################################
+    @torch.no_grad()
+    def sdedit_sample_loop(self, model, original_image, mask, num_inference_steps, 
+                           autoencoder, use_autoencoder=False, model_kwargs={}, clamp=None, percentile=None, 
+                           condition_fn=None, guide_scale=None, ddim_timesteps=20, eta=0.0,
+                           middle_time_steps=1000, jump_length=1, jump_n_sample=1, add_small_steps=True):
+        
+        # original_image  [1, C, F, H, W] : [1, 3, 24, 256, 256]
+        # prepare input
+        b = original_image.size(0) # batch size
+        # [1, C, F, H, W] -> [F, C, H, W]
+        # import ipdb; ipdb.set_trace()
+        original_image = original_image.squeeze(0).permute(1, 0, 2, 3).contiguous()
+        latents = autoencoder.encode_firsr_stage(original_image, 0.18215) # [F, C, H, W]
+        # [F, C, H, W] -> [1, C, F, H, W]
+        original_image = original_image.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
+        
+        # [F,C,H,W] - >[1, C, F, H, W] : [1, 4, 24, 32, 32]
+        latents = latents.unsqueeze(0).permute(0, 2, 1, 3, 4).contiguous()
+        
+        original_latents = latents.clone()
+        
+        if use_autoencoder:
+            autoencoder = autoencoder
+        else:
+            autoencoder = None
+        
+        
+        
+        # xt = noise # [B, C, F, H, W] latent of image
+        if middle_time_steps == 1000:
+            xt = torch.randn_like(latents) # [B, C, F, H, W] latent of image
+        else: 
+            xt = self.q_sample(latents, middle_time_steps, noise=None) # [B, C, F, H, W] latent of image
+        
+        mask = torch.nn.functional.interpolate(mask, size=(xt.shape[2], xt.shape[3], xt.shape[4]), mode='nearest')
+        
+        mask = self.apply_distance_transform(mask, max_distance=5)
+        # set timesteps
+        self.set_timesteps(num_inference_steps, middle_time_steps, jump_length, jump_n_sample, add_small_steps=True)
+        
+        timesteps = self.timesteps
+        
+        # diffusion process
+        for i, t in enumerate(timesteps):
+            if  i < len(timesteps) - 1 and timesteps[i + 1] < t:
+                prev_timestep = timesteps[i + 1] #if i > 0 else -1
+            elif i == len(timesteps) - 1:
+                prev_timestep = -1
+            elif i < len(timesteps) - 1 and timesteps[i + 1] > t:
+                # prev_timestep = None
+                prev_timestep = timesteps[i + 1] #if i > 0 else -1
+            else:
+                raise ValueError("Invalid timesteps same value")
+            if prev_timestep :
+                if t < prev_timestep:
+                    # compute the reverse: x_t-1 -> x_t
+                    latents = self.undo_step(latents, t, prev_timestep, generator=None)
+                    # t_last = t
+                    continue
+            
+            # import ipdb; ipdb.set_trace()
+            t = torch.full((b, ), t, dtype=torch.long, device=xt.device)
+            prev_timestep = torch.full((b, ), prev_timestep, dtype=torch.long, device=xt.device)
+            
+            # 여기에 특정 index에 대해서 autoencoder를 사용할지 말지 결정하는 코드 추가해야함 
+            # autoencoder를 사용하는 경우 unet에서 3d_aware_denoising을 함. (lgm으로 3dgs 예측해서 render하고 다시 x_t_1로 보냄)
+            latents, _ = self.masked_ddim_step(latents, t, model, original_latents, mask, prev_t=prev_timestep, 
+                                            autoencoder=autoencoder, model_kwargs=model_kwargs, clamp=clamp, 
+                                            percentile=percentile, condition_fn=condition_fn, guide_scale=guide_scale, 
+                                            ddim_timesteps=ddim_timesteps, eta=eta)
+        return latents
+            
+    
+    def undo_step(self, xt, t, prev_t, generator=None):
+        r"""Sample from q(x_{t+1} | x_t) """
+        n = prev_t - t # prev_t > t
+        
+        for i in range(n):
+            beta = self.betas[t + i]
+            
+            noise = torch.randn_like(xt, dtype=xt.dtype, device=xt.device)
+            
+            xt = (1 - beta) ** 0.5 * xt + (beta ** 0.5) * noise
+        
+        return xt
+    
+    def masked_ddim_step(   
+                            self, 
+                            xt,
+                            t,
+                            model,
+                            original_image,
+                            mask,
+                            prev_t=None ,
+                            autoencoder=None,
+                            model_kwargs={},
+                            clamp=None,
+                            percentile=None,
+                            condition_fn=None,
+                            guide_scale=None,
+                            ddim_timesteps=20,
+                            eta=0.0,
+                        ):
+        
+        if prev_t is None:
+            prev_t = self.middle_time_steps // self.num_inference_steps
+
+        _, _, _, x0 = self.p_mean_variance(xt, t, model, autoencoder, model_kwargs, clamp, percentile, guide_scale)
+        
+        if condition_fn is not None:
+            # x0 -> eps
+            alpha = _i(self.alphas_cumprod, t, xt)
+            eps = (_i(self.sqrt_recip_alphas_cumprod, t, xt) * xt - x0) / \
+                  _i(self.sqrt_recipm1_alphas_cumprod, t, xt)
+            eps = eps - (1 - alpha).sqrt() * condition_fn(xt, self._scale_timesteps(t), **model_kwargs)
+
+            # eps -> x0
+            x0 = _i(self.sqrt_recip_alphas_cumprod, t, xt) * xt - \
+                 _i(self.sqrt_recipm1_alphas_cumprod, t, xt) * eps
+        
+        # derive variables
+        eps = (_i(self.sqrt_recip_alphas_cumprod, t, xt) * xt - x0) / \
+              _i(self.sqrt_recipm1_alphas_cumprod, t, xt)
+        alphas = _i(self.alphas_cumprod, t, xt)
+        alphas_prev = _i(self.alphas_cumprod, (prev_t).clamp(0), xt) if prev_t >= 0 else torch.tensor(1.0)
+        sigmas = eta * torch.sqrt((1 - alphas_prev) / (1 - alphas) * (1 - alphas / alphas_prev))
+        
+        # prev_unkown part compute x_{t-1}
+        noise = torch.randn_like(xt) 
+        direction = torch.sqrt(1 - alphas_prev - sigmas ** 2) * eps
+        mask_0 = t.ne(0).float().view(-1, *((1, ) * (xt.ndim - 1)))
+        prev_unknown_part = torch.sqrt(alphas_prev) * x0 + direction + mask_0 * sigmas * noise
+        
+        # known part compute x_{t-1} from x_0 of known part
+        # prev_known_part = self.q_sample(original_image, prev_t, noise) 
+        prev_known_part = torch.sqrt(alphas_prev) * original_image + torch.sqrt(1 - alphas_prev) * noise
+        
+        # combine known and unknown part
+        pred = mask * prev_unknown_part + (1 - mask) * prev_known_part
+        
+        return pred, x0
+    
+    def set_timesteps(self, num_inference_steps, middle_time_steps, jump_length, jump_n_sample, add_small_steps=True):
+        
+        num_inference_steps = min(num_inference_steps, self.num_timesteps)
+        self.num_inference_steps = num_inference_steps
+        self.middle_time_steps = middle_time_steps
+        timesteps = []
+        
+        jumps = {}
+        for j in range(0, num_inference_steps - jump_length, jump_length):
+            jumps[j] = jump_n_sample - 1
+
+        t = num_inference_steps
+        while t >= 1:
+            t = t - 1
+            timesteps.append(t)
+
+            if jumps.get(t, 0) > 0:
+                jumps[t] = jumps[t] - 1
+                for _ in range(jump_length):
+                    t = t + 1
+                    timesteps.append(t)
+
+        timesteps = np.array(timesteps) * (self.middle_time_steps // self.num_inference_steps)
+        timesteps = timesteps[:-1] # 0 제외 
+        
+        if add_small_steps :
+            while timesteps[-1] >= 2 : # 자잘한 값 추가 
+                timesteps=np.append(timesteps,timesteps[-1] // 2) # 중간값 추가
+        timesteps=np.append(timesteps, 0)
+        
+        if middle_time_steps == 1000:
+            timesteps = np.insert(timesteps, 0, 999)
+        else:
+            timesteps = np.insert(timesteps, 0, middle_time_steps)
+        self.timesteps = torch.from_numpy(timesteps).to(self.device)
+    
+    def apply_distance_transform(self,mask, max_distance=10):
+        """
+        5D 이진 마스크에 Distance Transform을 적용하여 부드럽게 확장된 마스크를 생성합니다.
+
+        Args:
+            mask (torch.Tensor): 0과 1로 이루어진 (B, C, F, H, W) 형태의 마스크 텐서.
+            max_distance (float): 거리 최대값. 이 값을 넘어가는 거리들은 0으로 클리핑됩니다.
+
+        Returns:
+            torch.Tensor: Distance Transform이 적용된 PyTorch 텐서.
+        """
+        # 입력 검증: 5D 텐서인지 확인
+        assert mask.dim() == 5, "Input mask must be a 5D tensor (B, C, F, H, W)"
+        
+        # 텐서를 넘파이 배열로 변환
+        mask_np = mask.cpu().numpy().astype(np.uint8)
+
+        # Distance Transform을 각 (H, W) 슬라이스에 대해 수행
+        distance = np.zeros_like(mask_np, dtype=np.float32)
+        for b in range(mask_np.shape[0]):  # 배치 차원
+            for c in range(mask_np.shape[1]):  # 채널 차원
+                for f in range(mask_np.shape[2]):  # 프레임 차원
+                    distance[b, c, f] = distance_transform_edt(mask_np[b, c, f] == 0)
+
+        # 거리 값을 max_distance를 기준으로 1과 0 사이의 범위로 클리핑
+        soft_mask = np.clip(1 - distance / max_distance, 0, 1)
+
+        # PyTorch 텐서로 변환하여 반환
+        return torch.from_numpy(soft_mask).to(mask.device).to(torch.float32)
+
+    ############################################################################################
     
     @torch.no_grad()
     def ddim_reverse_sample(self, xt, t, model, model_kwargs={}, clamp=None, percentile=None, guide_scale=None, ddim_timesteps=20):
@@ -292,6 +510,13 @@ class DiffusionDDIM(object):
             t = torch.full((b, ), step, dtype=torch.long, device=xt.device)
             xt, _ = self.ddim_reverse_sample(xt, t, model, model_kwargs, clamp, percentile, guide_scale, ddim_timesteps)
         return xt
+    
+
+
+    
+    
+    
+    
     
     @torch.no_grad()
     def plms_sample(self, xt, t, model, model_kwargs={}, clamp=None, percentile=None, condition_fn=None, guide_scale=None, plms_timesteps=20):
